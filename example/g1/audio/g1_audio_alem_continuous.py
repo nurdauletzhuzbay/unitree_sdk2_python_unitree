@@ -361,43 +361,70 @@ async def _edge_tts_to_wav(text: str, wav_path: str, voice: str):
 
 def generate_speech(text: str) -> Optional[List[int]]:
     """
-    Generate speech using Edge TTS and return PCM int16 list at SAMPLE_RATE mono.
+    Generate speech using Edge TTS CLI and return PCM int16 list at SAMPLE_RATE mono.
+    This avoids asyncio/event-loop issues on Python 3.8.
     """
     if not g_running:
         return None
 
-    try:
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
-            wav_file = tmp_wav.name
-
-        with tempfile.NamedTemporaryFile(suffix='.pcm', delete=False) as tmp_pcm:
-            pcm_file = tmp_pcm.name
-
-        # 1) Edge TTS -> WAV
-        asyncio.run(_edge_tts_to_wav(text=text, wav_path=wav_file, voice=EDGE_TTS_VOICE))
-
-        # 2) Convert WAV -> raw PCM 16kHz mono int16 (same format your aplay expects)
-        cmd = f"ffmpeg -y -i {wav_file} -ar {SAMPLE_RATE} -ac 1 -f s16le {pcm_file}"
-        subprocess.run(cmd, shell=True, check=True, capture_output=True)
-
-        if g_running and os.path.exists(pcm_file):
-            with open(pcm_file, 'rb') as f:
-                pcm_data = f.read()
-
-            audio = list(struct.unpack(f'{len(pcm_data)//2}h', pcm_data))
-            return audio
-
+    text = (text or "").strip()
+    if not text:
         return None
 
+    mp3_file = None
+    pcm_file = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+            mp3_file = tmp_mp3.name
+
+        with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as tmp_pcm:
+            pcm_file = tmp_pcm.name
+
+        # 1) Edge TTS -> MP3 (same as the command that works for you)
+        cmd_tts = [
+            "python3", "-m", "edge_tts",
+            "--voice", EDGE_TTS_VOICE,
+            "--text", text,
+            "--write-media", mp3_file
+        ]
+        subprocess.run(cmd_tts, check=True)
+
+        # Sanity check: mp3 must be non-empty
+        if not os.path.exists(mp3_file) or os.path.getsize(mp3_file) < 1024:
+            raise RuntimeError("Edge TTS produced empty MP3 (unexpected).")
+
+        # 2) MP3 -> raw PCM 16kHz mono s16le
+        cmd_ffmpeg = [
+            "ffmpeg", "-y",
+            "-i", mp3_file,
+            "-ar", str(SAMPLE_RATE),
+            "-ac", "1",
+            "-f", "s16le",
+            pcm_file
+        ]
+        subprocess.run(cmd_ffmpeg, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if not os.path.exists(pcm_file) or os.path.getsize(pcm_file) < 2:
+            raise RuntimeError("FFmpeg produced empty PCM.")
+
+        with open(pcm_file, "rb") as f:
+            pcm_data = f.read()
+
+        audio = list(struct.unpack(f"{len(pcm_data)//2}h", pcm_data))
+        return audio
+
+    except subprocess.CalledProcessError as e:
+        print(f"TTS error: edge_tts/ffmpeg failed: {e}")
+        return None
     except Exception as e:
         print(f"TTS error: {e}")
         return None
     finally:
-        for f in ["wav_file", "pcm_file"]:
+        for p in [mp3_file, pcm_file]:
             try:
-                path = locals().get(f)
-                if path and os.path.exists(path):
-                    os.remove(path)
+                if p and os.path.exists(p):
+                    os.remove(p)
             except:
                 pass
 
